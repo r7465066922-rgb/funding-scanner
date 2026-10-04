@@ -1,6 +1,7 @@
 import json
 import threading
 import time
+
 from flask import Flask, jsonify, render_template_string
 
 try:
@@ -11,17 +12,18 @@ except Exception:
 
 app = Flask(__name__)
 
+
 # ============================================================
-# DATA STORAGE
+# GLOBAL DATA
 # ============================================================
 
 delta_data = {}
-binance_data = {}
-
-delta_connected = False
-binance_browser_seen = False
 
 delta_lock = threading.Lock()
+
+delta_connected = False
+
+delta_thread_started = False
 
 
 # ============================================================
@@ -32,20 +34,14 @@ def now_ms():
     return int(time.time() * 1000)
 
 
-def clean_number(value):
+def number(value):
     try:
         return float(value)
     except Exception:
         return None
 
 
-def base_from_delta(symbol):
-    """
-    Delta:
-      BTCUSD -> BTC
-      ETHUSD -> ETH
-      SOLUSD -> SOL
-    """
+def delta_base(symbol):
     if not symbol:
         return None
 
@@ -57,114 +53,20 @@ def base_from_delta(symbol):
     return s
 
 
-def base_from_binance(symbol):
-    """
-    Binance:
-      BTCUSDT -> BTC
-      ETHUSDT -> ETH
-      SOLUSDT -> SOL
-    """
-    if not symbol:
-        return None
-
-    s = str(symbol).upper()
-
-    if s.endswith("USDT"):
-        return s[:-4]
-
-    return None
-
-
 # ============================================================
 # DELTA WEBSOCKET
 # ============================================================
 
-DELTA_WS_URL = "wss://public-socket.india.delta.exchange"
+DELTA_WS = "wss://public-socket.india.delta.exchange"
 
 
-def delta_on_message(ws, message):
-    global delta_connected
+def delta_open(ws):
 
-    try:
-        data = json.loads(message)
-
-        # Subscription confirmation
-        if data.get("type") == "subscriptions":
-            delta_connected = True
-            return
-
-        # Funding rate message
-        if data.get("type") != "funding_rate":
-            return
-
-        symbol = data.get("sy")
-
-        if not symbol:
-            return
-
-        symbol = str(symbol).upper()
-
-        # Delta fr is already in percentage units.
-        # Example:
-        # 0.00638 = 0.00638%
-        fr = clean_number(data.get("fr"))
-
-        # fi = funding interval in seconds
-        fi = clean_number(data.get("fi"))
-
-        # nfr = next funding realization in microseconds
-        nfr = clean_number(data.get("nfr"))
-
-        if fr is None:
-            return
-
-        if fi is None or fi <= 0:
-            fi = 28800
-
-        base = base_from_delta(symbol)
-
-        if not base:
-            return
-
-        next_funding_ms = None
-
-        if nfr:
-            next_funding_ms = int(nfr / 1000)
-
-        item = {
-            "symbol": symbol,
-            "base": base,
-            "rate_pct": fr,
-            "interval_sec": int(fi),
-            "next_funding_ms": next_funding_ms,
-            "updated_ms": now_ms(),
-        }
-
-        with delta_lock:
-            delta_data[base] = item
-
-        delta_connected = True
-
-    except Exception:
-        pass
-
-
-def delta_on_error(ws, error):
-    global delta_connected
-    delta_connected = False
-
-
-def delta_on_close(ws, close_status_code, close_msg):
-    global delta_connected
-    delta_connected = False
-
-
-def delta_on_open(ws):
     global delta_connected
 
     delta_connected = True
 
-    subscribe_message = {
+    message = {
         "type": "subscribe",
         "payload": {
             "channels": [
@@ -176,44 +78,121 @@ def delta_on_open(ws):
         }
     }
 
-    ws.send(json.dumps(subscribe_message))
+    try:
+        ws.send(json.dumps(message))
+    except Exception:
+        pass
+
+
+def delta_message(ws, message):
+
+    global delta_connected
+
+    try:
+
+        data = json.loads(message)
+
+        if data.get("type") == "subscriptions":
+            delta_connected = True
+            return
+
+        if data.get("type") != "funding_rate":
+            return
+
+        symbol = data.get("sy")
+
+        if not symbol:
+            return
+
+        symbol = str(symbol).upper()
+
+        rate = number(data.get("fr"))
+
+        interval = number(data.get("fi"))
+
+        next_funding = number(data.get("nfr"))
+
+        if rate is None:
+            return
+
+        if interval is None or interval <= 0:
+            interval = 28800
+
+        base = delta_base(symbol)
+
+        if not base:
+            return
+
+        next_ms = None
+
+        if next_funding:
+            next_ms = int(next_funding / 1000)
+
+        item = {
+            "symbol": symbol,
+            "base": base,
+            "rate_pct": rate,
+            "interval_sec": int(interval),
+            "next_funding_ms": next_ms,
+            "updated_ms": now_ms()
+        }
+
+        with delta_lock:
+            delta_data[base] = item
+
+        delta_connected = True
+
+    except Exception:
+        pass
+
+
+def delta_error(ws, error):
+
+    global delta_connected
+
+    delta_connected = False
+
+
+def delta_close(ws, code, message):
+
+    global delta_connected
+
+    delta_connected = False
 
 
 def delta_loop():
+
     global delta_connected
 
     if websocket is None:
         return
 
     while True:
+
         try:
+
             ws = websocket.WebSocketApp(
-                DELTA_WS_URL,
-                on_open=delta_on_open,
-                on_message=delta_on_message,
-                on_error=delta_on_error,
-                on_close=delta_on_close,
+                DELTA_WS,
+                on_open=delta_open,
+                on_message=delta_message,
+                on_error=delta_error,
+                on_close=delta_close
             )
 
             ws.run_forever(
                 ping_interval=25,
-                ping_timeout=10,
+                ping_timeout=10
             )
 
         except Exception:
+
             delta_connected = False
 
         time.sleep(5)
 
 
-# ============================================================
-# START DELTA THREAD
-# ============================================================
+def start_delta():
 
-delta_thread_started = False
-
-
-def start_delta_thread():
     global delta_thread_started
 
     if delta_thread_started:
@@ -229,123 +208,48 @@ def start_delta_thread():
     thread.start()
 
 
-start_delta_thread()
+start_delta()
 
 
 # ============================================================
-# API
+# SERVER API
 # ============================================================
 
 @app.route("/api/data")
 def api_data():
 
     with delta_lock:
-        dcopy = dict(delta_data)
+        d = dict(delta_data)
 
-    bcopy = dict(binance_data)
-
-    all_bases = sorted(
-        set(dcopy.keys()) | set(bcopy.keys())
-    )
+    coins = sorted(d.keys())
 
     rows = []
 
-    for base in all_bases:
+    for coin in coins:
 
-        d = dcopy.get(base)
-        b = bcopy.get(base)
+        rows.append({
+            "base": coin,
+            "delta": d.get(coin)
+        })
 
-        row = {
-            "base": base,
-            "delta": d,
-            "binance": b,
-            "status": "common" if d and b else (
-                "delta_only" if d else "binance_only"
-            ),
-            "gap_hourly_pct": None,
-        }
-
-        # ----------------------------------------------------
-        # GAP CALCULATION
-        # ----------------------------------------------------
-        if d and b:
-
-            delta_rate = d.get("rate_pct")
-            delta_interval = d.get("interval_sec") or 28800
-
-            binance_rate = b.get("rate_pct")
-            binance_interval = b.get("interval_sec") or 28800
-
-            try:
-                delta_hourly = (
-                    float(delta_rate)
-                    * 3600.0
-                    / float(delta_interval)
-                )
-
-                binance_hourly = (
-                    float(binance_rate)
-                    * 3600.0
-                    / float(binance_interval)
-                )
-
-                row["gap_hourly_pct"] = (
-                    delta_hourly - binance_hourly
-                )
-
-            except Exception:
-                row["gap_hourly_pct"] = None
-
-        rows.append(row)
-
-    common_count = sum(
-        1 for x in rows
-        if x["status"] == "common"
-    )
-
-    delta_only_count = sum(
-        1 for x in rows
-        if x["status"] == "delta_only"
-    )
-
-    binance_only_count = sum(
-        1 for x in rows
-        if x["status"] == "binance_only"
-    )
-
-    result = {
+    return jsonify({
         "rows": rows,
-
-        "delta_count": len(dcopy),
-        "binance_count": len(bcopy),
-        "total_count": len(all_bases),
-
-        "common_count": common_count,
-        "delta_only_count": delta_only_count,
-        "binance_only_count": binance_only_count,
-
+        "delta_count": len(d),
         "delta_connected": delta_connected,
-
-        "server_time": now_ms(),
-    }
-
-    return jsonify(result)
+        "server_time": now_ms()
+    })
 
 
 @app.route("/status")
 def status():
 
     with delta_lock:
-        dc = len(delta_data)
-
-    bc = len(binance_data)
+        count = len(delta_data)
 
     return jsonify({
-        "delta": dc,
-        "binance": bc,
-        "total": len(set(delta_data.keys()) | set(binance_data.keys())),
+        "delta": count,
         "delta_connected": delta_connected,
-        "binance_browser": binance_browser_seen,
+        "time": now_ms()
     })
 
 
@@ -355,7 +259,9 @@ def status():
 
 HTML = r"""
 <!DOCTYPE html>
+
 <html>
+
 <head>
 
 <meta charset="UTF-8">
@@ -365,7 +271,8 @@ HTML = r"""
     content="width=device-width, initial-scale=1.0"
 >
 
-<title>Funding Gap Scanner</title>
+<title>Crypto Funding Gap Scanner</title>
+
 
 <style>
 
@@ -376,45 +283,66 @@ body {
     background: #f4f4f4;
 }
 
-h2 {
-    margin-top: 0;
+h1 {
+    font-size: 28px;
+    margin: 10px 0 20px;
 }
 
 #statusBox {
     background: white;
-    padding: 12px;
-    border-radius: 10px;
+    border-radius: 12px;
+    padding: 18px;
+    margin-bottom: 12px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.12);
+}
+
+.status {
+    font-size: 16px;
+    margin: 7px 0;
+}
+
+button {
+    background: #222;
+    color: white;
+    border: 0;
+    border-radius: 8px;
+    padding: 12px 18px;
+    font-size: 16px;
+    margin-bottom: 15px;
+}
+
+#message {
+    background: white;
+    padding: 15px;
+    border-radius: 8px;
     margin-bottom: 10px;
-    box-shadow: 0 1px 5px rgba(0,0,0,0.12);
 }
 
-.statusLine {
-    margin: 4px 0;
-    font-size: 14px;
-}
-
-.connected {
-    font-weight: bold;
+.tableWrap {
+    width: 100%;
+    overflow-x: auto;
+    background: white;
 }
 
 table {
     width: 100%;
+    min-width: 900px;
     border-collapse: collapse;
     background: white;
-    font-size: 12px;
 }
 
 th {
     background: #222;
     color: white;
-    padding: 8px 5px;
+    padding: 10px 7px;
+    cursor: pointer;
     position: sticky;
     top: 0;
-    cursor: pointer;
+    z-index: 2;
 }
 
 td {
-    padding: 7px 5px;
+    padding: 9px 7px;
     border-bottom: 1px solid #ddd;
     text-align: center;
 }
@@ -425,15 +353,15 @@ td:first-child {
 }
 
 .common {
-    background: #ffffff;
+    background: white;
 }
 
 .deltaOnly {
-    background: #fff8dc;
+    background: #fff8d9;
 }
 
 .binanceOnly {
-    background: #eaf4ff;
+    background: #e8f3ff;
 }
 
 .positive {
@@ -448,87 +376,89 @@ td:first-child {
     font-size: 11px;
 }
 
-#loading {
-    padding: 20px;
-    text-align: center;
-}
-
-button {
-    padding: 8px 12px;
-    margin-bottom: 10px;
-    border: 0;
-    border-radius: 7px;
-    background: #222;
-    color: white;
-}
-
 </style>
 
 </head>
 
+
 <body>
 
-<h2>Crypto Funding Gap Scanner</h2>
+
+<h1>
+Crypto Funding Gap Scanner
+</h1>
+
 
 <div id="statusBox">
 
-    <div class="statusLine">
-        Delta:
-        <span id="deltaStatus">0</span>
-    </div>
+<div class="status">
+Delta:
+<span id="deltaCount">0</span>
+</div>
 
-    <div class="statusLine">
-        Binance:
-        <span id="binanceStatus">0</span>
-    </div>
+<div class="status">
+Binance:
+<span id="binanceCount">0</span>
+</div>
 
-    <div class="statusLine">
-        Total:
-        <span id="totalStatus">0</span>
-    </div>
+<div class="status">
+Total:
+<span id="totalCount">0</span>
+</div>
 
-    <div class="statusLine">
-        Common:
-        <span id="commonStatus">0</span>
-    </div>
+<div class="status">
+Common:
+<span id="commonCount">0</span>
+</div>
 
-    <div class="statusLine">
-        Delta only:
-        <span id="deltaOnlyStatus">0</span>
-    </div>
+<div class="status">
+Delta only:
+<span id="deltaOnlyCount">0</span>
+</div>
 
-    <div class="statusLine">
-        Binance only:
-        <span id="binanceOnlyStatus">0</span>
-    </div>
+<div class="status">
+Binance only:
+<span id="binanceOnlyCount">0</span>
+</div>
 
-    <div class="statusLine">
-        Delta connection:
-        <span id="deltaConnection">Connecting...</span>
-    </div>
+<div class="status">
+Delta connection:
+<span id="deltaConnection">
+Connecting...
+</span>
+</div>
 
-    <div class="statusLine">
-        Binance connection:
-        <span id="binanceConnection">Connecting...</span>
-    </div>
+<div class="status">
+Binance connection:
+<span id="binanceConnection">
+Connecting...
+</span>
+</div>
 
 </div>
 
-<button onclick="refreshData()">
-    Refresh
+
+<button onclick="loadEverything()">
+Refresh
 </button>
 
-<div id="loading">
-    Loading data...
+
+<div id="message">
+Loading...
 </div>
 
-<table id="dataTable" style="display:none;">
+
+<div class="tableWrap">
+
+<table id="scannerTable">
 
 <thead>
 
 <tr>
 
-<th>Coin</th>
+<th>
+Coin
+</th>
 
 <th>
 Delta Funding
@@ -546,7 +476,7 @@ Binance Funding
 Binance Interval
 </th>
 
-<th id="gapHeader" onclick="toggleGapSort()">
+<th onclick="toggleSort()">
 Gap / H ↕
 </th>
 
@@ -563,57 +493,42 @@ Status
 </thead>
 
 <tbody id="tableBody">
+
 </tbody>
 
 </table>
 
+</div>
+
 
 <script>
 
-/* ==========================================================
-   BINANCE DATA
-   ========================================================== */
+
+// ==========================================================
+// BINANCE DATA
+// ==========================================================
 
 let binanceData = {};
 
 let binanceSocket = null;
 
-let binanceReconnectTimer = null;
+let reconnectTimer = null;
 
 let binanceConnected = false;
 
 
-/* ==========================================================
-   SORT
-   ========================================================== */
+// ==========================================================
+// SORT
+// ==========================================================
 
-let gapSortMode = "none";
-
-
-function toggleGapSort() {
-
-    if (gapSortMode === "none") {
-
-        gapSortMode = "desc";
-
-    } else if (gapSortMode === "desc") {
-
-        gapSortMode = "asc";
-
-    } else {
-
-        gapSortMode = "none";
-    }
-
-    refreshData();
-}
+let sortMode = "none";
 
 
-/* ==========================================================
-   NUMBER FORMAT
-   ========================================================== */
+// ==========================================================
+// FORMAT
+// ==========================================================
 
-function fmtRate(value) {
+function rateText(value) {
 
     if (
         value === null ||
@@ -627,7 +542,7 @@ function fmtRate(value) {
 }
 
 
-function fmtInterval(seconds) {
+function intervalText(seconds) {
 
     if (
         seconds === null ||
@@ -642,17 +557,17 @@ function fmtInterval(seconds) {
         return "-";
     }
 
-    let hours = s / 3600;
+    if (s >= 3600) {
 
-    if (hours >= 1) {
-        return hours.toFixed(2) + "h";
+        return (s / 3600).toFixed(2) + "h";
+
     }
 
     return Math.round(s / 60) + "m";
 }
 
 
-function fmtGap(value) {
+function gapText(value) {
 
     if (
         value === null ||
@@ -664,11 +579,15 @@ function fmtGap(value) {
 
     let n = Number(value);
 
+    if (n >= 0) {
+        return "+" + n.toFixed(6) + "%";
+    }
+
     return n.toFixed(6) + "%";
 }
 
 
-function fmtNext(ms) {
+function timeText(ms) {
 
     if (
         ms === null ||
@@ -678,15 +597,188 @@ function fmtNext(ms) {
         return "-";
     }
 
-    let d = new Date(Number(ms));
+    try {
 
-    return d.toLocaleTimeString();
+        return new Date(
+            Number(ms)
+        ).toLocaleTimeString();
+
+    } catch(e) {
+
+        return "-";
+    }
 }
 
 
-/* ==========================================================
-   BINANCE WEBSOCKET
-   ========================================================== */
+// ==========================================================
+// BINANCE MESSAGE PROCESSOR
+// ==========================================================
+
+function processBinanceMessage(message) {
+
+    try {
+
+        let payload = message;
+
+        /*
+         * Combined Binance stream:
+         *
+         * {
+         *   "stream": "...",
+         *   "data": [...]
+         * }
+         */
+
+        if (
+            message &&
+            message.data !== undefined
+        ) {
+
+            payload = message.data;
+        }
+
+
+        /*
+         * Some streams may provide a single object.
+         */
+
+        if (!Array.isArray(payload)) {
+
+            payload = [payload];
+        }
+
+
+        let received = 0;
+
+
+        for (let x of payload) {
+
+            if (!x) {
+                continue;
+            }
+
+
+            let symbol =
+                String(
+                    x.s || ""
+                ).toUpperCase();
+
+
+            if (!symbol.endsWith("USDT")) {
+                continue;
+            }
+
+
+            let base =
+                symbol.substring(
+                    0,
+                    symbol.length - 4
+                );
+
+
+            if (!base) {
+                continue;
+            }
+
+
+            /*
+             * Binance funding rate is decimal.
+             *
+             * Example:
+             *
+             * 0.0001
+             *
+             * means:
+             *
+             * 0.01%
+             */
+
+            let funding =
+                Number(x.r);
+
+
+            if (!Number.isFinite(funding)) {
+                continue;
+            }
+
+
+            let ratePct =
+                funding * 100;
+
+
+            /*
+             * Next funding timestamp.
+             */
+
+            let nextFunding =
+                Number(x.T);
+
+
+            if (
+                !Number.isFinite(nextFunding) ||
+                nextFunding <= 0
+            ) {
+
+                nextFunding = null;
+            }
+
+
+            /*
+             * Default interval:
+             *
+             * 8 hours.
+             *
+             * fundingInfo can update this later.
+             */
+
+            let interval =
+                28800;
+
+
+            binanceData[base] = {
+
+                symbol: symbol,
+
+                base: base,
+
+                rate_pct: ratePct,
+
+                interval_sec: interval,
+
+                next_funding_ms:
+                    nextFunding,
+
+                updated_ms:
+                    Date.now()
+            };
+
+
+            received++;
+        }
+
+
+        if (received > 0) {
+
+            binanceConnected = true;
+
+            updateConnectionText();
+
+        }
+
+
+    } catch(e) {
+
+        console.log(
+            "Binance parse error",
+            e
+        );
+    }
+}
+
+
+// ==========================================================
+// BINANCE WEBSOCKET
+// ==========================================================
 
 function connectBinance() {
 
@@ -700,166 +792,118 @@ function connectBinance() {
 
         }
 
+
         /*
-         * Binance USD-M Futures all-symbol mark price stream.
+         * Combined Binance Futures stream.
          *
-         * It gives:
-         * s = symbol
-         * r = funding rate
-         * i = next funding time
+         * This is deliberately used instead of
+         * the raw /ws endpoint so we can handle
+         * the {stream,data} format reliably.
          */
 
         let url =
-            "wss://fstream.binance.com/ws/!markPrice@arr@1s";
-
-        binanceSocket = new WebSocket(url);
-
-        binanceSocket.onopen = function() {
-
-            binanceConnected = true;
-
-            document.getElementById(
-                "binanceConnection"
-            ).innerText = "Connected";
-
-        };
+            "wss://fstream.binance.com/stream?streams=!markPrice@arr@1s";
 
 
-        binanceSocket.onmessage = function(event) {
+        binanceSocket =
+            new WebSocket(url);
 
-            try {
 
-                let message =
-                    JSON.parse(event.data);
-
-                if (!Array.isArray(message)) {
-                    return;
-                }
-
-                for (let x of message) {
-
-                    if (!x) {
-                        continue;
-                    }
-
-                    let symbol =
-                        String(x.s || "").toUpperCase();
-
-                    if (!symbol.endsWith("USDT")) {
-                        continue;
-                    }
-
-                    let base =
-                        symbol.substring(
-                            0,
-                            symbol.length - 4
-                        );
-
-                    if (!base) {
-                        continue;
-                    }
-
-                    /*
-                     * Binance r is decimal.
-                     *
-                     * Example:
-                     * 0.0001 = 0.01%
-                     *
-                     * Therefore multiply by 100.
-                     */
-
-                    let funding =
-                        Number(x.r);
-
-                    if (!Number.isFinite(funding)) {
-                        continue;
-                    }
-
-                    let ratePct =
-                        funding * 100;
-
-                    let nextFunding =
-                        Number(x.T);
-
-                    if (
-                        !Number.isFinite(nextFunding) ||
-                        nextFunding <= 0
-                    ) {
-                        nextFunding = null;
-                    }
-
-                    /*
-                     * Default Binance funding interval
-                     * is 8 hours.
-                     *
-                     * It can be replaced by fundingInfo
-                     * if browser REST is available.
-                     */
-
-                    let intervalSec = 28800;
-
-                    binanceData[base] = {
-
-                        symbol: symbol,
-
-                        base: base,
-
-                        rate_pct: ratePct,
-
-                        interval_sec:
-                            intervalSec,
-
-                        next_funding_ms:
-                            nextFunding,
-
-                        updated_ms:
-                            Date.now()
-                    };
-                }
+        binanceSocket.onopen =
+            function() {
 
                 binanceConnected = true;
 
-            } catch(e) {
+                updateConnectionText();
 
-            }
-
-        };
-
-
-        binanceSocket.onerror = function() {
-
-            binanceConnected = false;
-
-            document.getElementById(
-                "binanceConnection"
-            ).innerText = "Error";
-
-        };
-
-
-        binanceSocket.onclose = function() {
-
-            binanceConnected = false;
-
-            document.getElementById(
-                "binanceConnection"
-            ).innerText = "Reconnecting...";
-
-            if (binanceReconnectTimer) {
-                clearTimeout(binanceReconnectTimer);
-            }
-
-            binanceReconnectTimer =
-                setTimeout(
-                    connectBinance,
-                    5000
+                console.log(
+                    "Binance WebSocket connected"
                 );
-        };
+            };
+
+
+        binanceSocket.onmessage =
+            function(event) {
+
+                try {
+
+                    let message =
+                        JSON.parse(
+                            event.data
+                        );
+
+                    processBinanceMessage(
+                        message
+                    );
+
+                    renderStatus();
+
+                } catch(e) {
+
+                    console.log(
+                        "Binance message error",
+                        e
+                    );
+                }
+            };
+
+
+        binanceSocket.onerror =
+            function(error) {
+
+                console.log(
+                    "Binance WebSocket error",
+                    error
+                );
+
+                binanceConnected = false;
+
+                updateConnectionText();
+            };
+
+
+        binanceSocket.onclose =
+            function() {
+
+                console.log(
+                    "Binance WebSocket closed"
+                );
+
+                binanceConnected = false;
+
+                updateConnectionText();
+
+
+                if (reconnectTimer) {
+
+                    clearTimeout(
+                        reconnectTimer
+                    );
+                }
+
+
+                reconnectTimer =
+                    setTimeout(
+                        function() {
+
+                            connectBinance();
+
+                        },
+                        5000
+                    );
+            };
 
 
     } catch(e) {
 
+        console.log(
+            "Binance connection error",
+            e
+        );
+
         binanceConnected = false;
+
+        updateConnectionText();
 
         setTimeout(
             connectBinance,
@@ -869,19 +913,152 @@ function connectBinance() {
 }
 
 
-/* ==========================================================
-   LOAD BINANCE FUNDING INTERVALS
-   ========================================================== */
+// ==========================================================
+// BINANCE REST FALLBACK
+// ==========================================================
 
-async function loadBinanceIntervals() {
+async function binanceRestFallback() {
 
     try {
 
         /*
-         * This is browser-side.
-         * Therefore Render server does not need
-         * to call Binance REST.
+         * Browser-side request.
+         *
+         * Render server does NOT make this request.
          */
+
+        let response =
+            await fetch(
+                "https://fapi.binance.com/fapi/v1/premiumIndex",
+                {
+                    cache: "no-store"
+                }
+            );
+
+
+        if (!response.ok) {
+
+            console.log(
+                "Binance REST status:",
+                response.status
+            );
+
+            return;
+        }
+
+
+        let data =
+            await response.json();
+
+
+        if (!Array.isArray(data)) {
+            return;
+        }
+
+
+        let received = 0;
+
+
+        for (let x of data) {
+
+            let symbol =
+                String(
+                    x.symbol || ""
+                ).toUpperCase();
+
+
+            if (!symbol.endsWith("USDT")) {
+                continue;
+            }
+
+
+            let base =
+                symbol.substring(
+                    0,
+                    symbol.length - 4
+                );
+
+
+            let funding =
+                Number(
+                    x.lastFundingRate
+                );
+
+
+            if (!Number.isFinite(funding)) {
+                continue;
+            }
+
+
+            let next =
+                Number(
+                    x.nextFundingTime
+                );
+
+
+            if (
+                !Number.isFinite(next) ||
+                next <= 0
+            ) {
+
+                next = null;
+            }
+
+
+            binanceData[base] = {
+
+                symbol: symbol,
+
+                base: base,
+
+                rate_pct:
+                    funding * 100,
+
+                interval_sec:
+                    28800,
+
+                next_funding_ms:
+                    next,
+
+                updated_ms:
+                    Date.now()
+            };
+
+
+            received++;
+        }
+
+
+        if (received > 0) {
+
+            binanceConnected = true;
+
+            updateConnectionText();
+
+            renderStatus();
+
+            renderTable();
+
+        }
+
+
+    } catch(e) {
+
+        console.log(
+            "Binance REST fallback failed:",
+            e
+        );
+    }
+}
+
+
+// ==========================================================
+// FUNDING INTERVAL
+// ==========================================================
+
+async function loadFundingIntervals() {
+
+    try {
 
         let response =
             await fetch(
@@ -891,16 +1068,20 @@ async function loadBinanceIntervals() {
                 }
             );
 
+
         if (!response.ok) {
             return;
         }
 
+
         let data =
             await response.json();
+
 
         if (!Array.isArray(data)) {
             return;
         }
+
 
         for (let x of data) {
 
@@ -909,9 +1090,11 @@ async function loadBinanceIntervals() {
                     x.symbol || ""
                 ).toUpperCase();
 
+
             if (!symbol.endsWith("USDT")) {
                 continue;
             }
+
 
             let base =
                 symbol.substring(
@@ -919,322 +1102,502 @@ async function loadBinanceIntervals() {
                     symbol.length - 4
                 );
 
-            if (!base) {
+
+            if (!binanceData[base]) {
                 continue;
             }
+
 
             let hours =
                 Number(
                     x.fundingIntervalHours
                 );
 
+
             if (
                 Number.isFinite(hours) &&
-                hours > 0 &&
-                binanceData[base]
+                hours > 0
             ) {
 
-                binanceData[base].interval_sec =
+                binanceData[
+                    base
+                ].interval_sec =
                     hours * 3600;
             }
         }
 
+
+        renderTable();
+
+
     } catch(e) {
 
-        /*
-         * If this fails, 8-hour fallback remains.
-         */
-
+        console.log(
+            "Funding interval error",
+            e
+        );
     }
 }
 
 
-/* ==========================================================
-   GET SERVER DATA
-   ========================================================== */
+// ==========================================================
+// LOAD DELTA
+// ==========================================================
 
-async function refreshData() {
+let deltaRows = [];
+
+
+async function loadDelta() {
 
     try {
 
         let response =
             await fetch(
-                "/api/data?t=" + Date.now(),
+                "/api/data?t=" +
+                Date.now(),
                 {
                     cache: "no-store"
                 }
             );
 
+
         if (!response.ok) {
-            throw new Error("API error");
+            throw new Error(
+                "Server API error"
+            );
         }
+
 
         let data =
             await response.json();
 
-        renderStatus(data);
 
-        renderRows(data.rows || []);
+        deltaRows =
+            data.rows || [];
+
+
+        document.getElementById(
+            "deltaConnection"
+        ).innerText =
+            data.delta_connected
+                ? "Connected"
+                : "Disconnected";
+
+
+        renderStatus();
+
+        renderTable();
+
+
+        document.getElementById(
+            "message"
+        ).innerText =
+            "Live data";
+
 
     } catch(e) {
 
-        document.getElementById(
-            "loading"
-        ).innerText =
-            "Waiting for data...";
+        console.log(
+            "Delta API error",
+            e
+        );
 
+
+        document.getElementById(
+            "message"
+        ).innerText =
+            "Waiting for server data...";
     }
 }
 
 
-/* ==========================================================
-   STATUS
-   ========================================================== */
+// ==========================================================
+// STATUS
+// ==========================================================
 
-function renderStatus(data) {
+function renderStatus() {
+
+    let deltaCount =
+        deltaRows.length;
+
+
+    let binanceCount =
+        Object.keys(
+            binanceData
+        ).length;
+
+
+    let deltaSet =
+        new Set(
+            deltaRows.map(
+                x => x.base
+            )
+        );
+
+
+    let common = 0;
+
+    for (
+        let coin of deltaSet
+    ) {
+
+        if (
+            binanceData[coin]
+        ) {
+
+            common++;
+        }
+    }
+
+
+    let deltaOnly =
+        deltaCount -
+        common;
+
+
+    let binanceOnly =
+        binanceCount -
+        common;
+
+
+    let total =
+        deltaCount +
+        binanceOnly;
+
 
     document.getElementById(
-        "deltaStatus"
+        "deltaCount"
     ).innerText =
-        data.delta_count ?? 0;
+        deltaCount;
+
 
     document.getElementById(
-        "binanceStatus"
+        "binanceCount"
     ).innerText =
-        data.binance_count ?? 0;
+        binanceCount;
+
 
     document.getElementById(
-        "totalStatus"
+        "totalCount"
     ).innerText =
-        data.total_count ?? 0;
+        total;
+
 
     document.getElementById(
-        "commonStatus"
+        "commonCount"
     ).innerText =
-        data.common_count ?? 0;
+        common;
+
 
     document.getElementById(
-        "deltaOnlyStatus"
+        "deltaOnlyCount"
     ).innerText =
-        data.delta_only_count ?? 0;
+        deltaOnly;
+
 
     document.getElementById(
-        "binanceOnlyStatus"
+        "binanceOnlyCount"
     ).innerText =
-        data.binance_only_count ?? 0;
+        binanceOnly;
 
-    document.getElementById(
-        "deltaConnection"
-    ).innerText =
-        data.delta_connected
-            ? "Connected"
-            : "Disconnected";
+
+    updateConnectionText();
+}
+
+
+// ==========================================================
+// CONNECTION TEXT
+// ==========================================================
+
+function updateConnectionText() {
 
     document.getElementById(
         "binanceConnection"
     ).innerText =
         binanceConnected
             ? "Connected"
-            : "Connecting...";
-
+            : "Disconnected";
 }
 
 
-/* ==========================================================
-   RENDER TABLE
-   ========================================================== */
+// ==========================================================
+// BUILD ROWS
+// ==========================================================
 
-function renderRows(rows) {
+function buildRows() {
+
+    let map = {};
+
 
     /*
-     * Replace server Binance data with
-     * browser Binance data where available.
-     *
-     * This makes the table use the latest
-     * Binance WebSocket values.
+     * Add Delta coins.
      */
 
-    let merged = [];
+    for (let row of deltaRows) {
 
-    for (let row of rows) {
+        let coin =
+            row.base;
 
-        let base = row.base;
+        map[coin] = {
 
-        let b =
-            binanceData[base];
+            base: coin,
 
-        if (b) {
+            delta:
+                row.delta || null,
 
-            row.binance = b;
-
-            if (row.delta) {
-
-                let deltaRate =
-                    Number(
-                        row.delta.rate_pct
-                    );
-
-                let deltaInterval =
-                    Number(
-                        row.delta.interval_sec ||
-                        28800
-                    );
-
-                let binanceRate =
-                    Number(
-                        b.rate_pct
-                    );
-
-                let binanceInterval =
-                    Number(
-                        b.interval_sec ||
-                        28800
-                    );
-
-                if (
-                    Number.isFinite(deltaRate) &&
-                    Number.isFinite(deltaInterval) &&
-                    Number.isFinite(binanceRate) &&
-                    Number.isFinite(binanceInterval)
-                ) {
-
-                    let deltaHourly =
-                        deltaRate *
-                        3600 /
-                        deltaInterval;
-
-                    let binanceHourly =
-                        binanceRate *
-                        3600 /
-                        binanceInterval;
-
-                    row.gap_hourly_pct =
-                        deltaHourly -
-                        binanceHourly;
-                }
-
-                row.status = "common";
-            }
-        }
-
-        merged.push(row);
+            binance:
+                null
+        };
     }
 
 
     /*
-     * Add Binance-only coins that may not yet
-     * have appeared in server response.
+     * Add Binance coins.
      */
 
     for (
-        let base in binanceData
+        let coin in binanceData
     ) {
 
-        let exists =
-            merged.some(
-                x => x.base === base
-            );
+        if (!map[coin]) {
 
-        if (exists) {
-            continue;
+            map[coin] = {
+
+                base: coin,
+
+                delta: null,
+
+                binance:
+                    binanceData[coin]
+            };
+
+        } else {
+
+            map[coin].binance =
+                binanceData[coin];
         }
+    }
 
-        merged.push({
 
-            base: base,
+    let rows =
+        Object.values(map);
 
-            delta: null,
 
-            binance:
-                binanceData[base],
+    /*
+     * Calculate gap.
+     */
 
-            status: "binance_only",
+    for (let row of rows) {
 
-            gap_hourly_pct: null
-        });
+        row.gap = null;
+
+
+        if (
+            row.delta &&
+            row.binance
+        ) {
+
+            let dr =
+                Number(
+                    row.delta.rate_pct
+                );
+
+
+            let di =
+                Number(
+                    row.delta.interval_sec ||
+                    28800
+                );
+
+
+            let br =
+                Number(
+                    row.binance.rate_pct
+                );
+
+
+            let bi =
+                Number(
+                    row.binance.interval_sec ||
+                    28800
+                );
+
+
+            if (
+                Number.isFinite(dr) &&
+                Number.isFinite(di) &&
+                Number.isFinite(br) &&
+                Number.isFinite(bi)
+            ) {
+
+                let deltaHourly =
+                    dr *
+                    3600 /
+                    di;
+
+
+                let binanceHourly =
+                    br *
+                    3600 /
+                    bi;
+
+
+                row.gap =
+                    deltaHourly -
+                    binanceHourly;
+            }
+        }
     }
 
 
     /*
-     * SORTING
+     * Status.
      */
 
-    if (gapSortMode === "desc") {
+    for (let row of rows) {
 
-        merged.sort(
-            function(a, b) {
+        if (
+            row.delta &&
+            row.binance
+        ) {
 
-                let av =
-                    a.gap_hourly_pct;
+            row.status =
+                "common";
 
-                let bv =
-                    b.gap_hourly_pct;
+        } else if (
+            row.delta
+        ) {
 
-                if (
-                    av === null ||
-                    av === undefined
-                ) {
-                    return 1;
-                }
+            row.status =
+                "deltaOnly";
 
-                if (
-                    bv === null ||
-                    bv === undefined
-                ) {
-                    return -1;
-                }
+        } else {
 
-                return (
-                    Math.abs(Number(bv)) -
-                    Math.abs(Number(av))
-                );
-            }
-        );
+            row.status =
+                "binanceOnly";
+        }
+    }
 
-    } else if (gapSortMode === "asc") {
 
-        merged.sort(
-            function(a, b) {
+    return rows;
+}
 
-                let av =
-                    a.gap_hourly_pct;
 
-                let bv =
-                    b.gap_hourly_pct;
+// ==========================================================
+// SORT
+// ==========================================================
 
-                if (
-                    av === null ||
-                    av === undefined
-                ) {
-                    return 1;
-                }
+function toggleSort() {
 
-                if (
-                    bv === null ||
-                    bv === undefined
-                ) {
-                    return -1;
-                }
+    if (sortMode === "none") {
 
-                return (
-                    Math.abs(Number(av)) -
-                    Math.abs(Number(bv))
-                );
-            }
-        );
+        sortMode = "desc";
+
+    } else if (
+        sortMode === "desc"
+    ) {
+
+        sortMode = "asc";
 
     } else {
 
-        merged.sort(
+        sortMode = "none";
+    }
+
+
+    renderTable();
+}
+
+
+function sortRows(rows) {
+
+    if (sortMode === "none") {
+
+        rows.sort(
             function(a, b) {
 
-                return String(a.base)
-                    .localeCompare(
-                        String(b.base)
-                    );
+                return String(
+                    a.base
+                ).localeCompare(
+                    String(b.base)
+                );
             }
         );
+
+        return rows;
     }
+
+
+    rows.sort(
+        function(a, b) {
+
+            let av =
+                a.gap;
+
+            let bv =
+                b.gap;
+
+
+            if (
+                av === null ||
+                av === undefined
+            ) {
+
+                return 1;
+            }
+
+
+            if (
+                bv === null ||
+                bv === undefined
+            ) {
+
+                return -1;
+            }
+
+
+            av =
+                Math.abs(
+                    Number(av)
+                );
+
+
+            bv =
+                Math.abs(
+                    Number(bv)
+                );
+
+
+            if (
+                sortMode === "desc"
+            ) {
+
+                return bv - av;
+
+            } else {
+
+                return av - bv;
+            }
+        }
+    );
+
+
+    return rows;
+}
+
+
+// ==========================================================
+// TABLE
+// ==========================================================
+
+function renderTable() {
+
+    let rows =
+        buildRows();
+
+
+    rows =
+        sortRows(rows);
 
 
     let tbody =
@@ -1242,21 +1605,29 @@ function renderRows(rows) {
             "tableBody"
         );
 
+
     tbody.innerHTML = "";
 
 
-    for (let row of merged) {
+    for (let row of rows) {
 
         let tr =
-            document.createElement("tr");
+            document.createElement(
+                "tr"
+            );
 
 
-        if (row.status === "delta_only") {
+        if (
+            row.status ===
+            "deltaOnly"
+        ) {
 
-            tr.className = "deltaOnly";
+            tr.className =
+                "deltaOnly";
 
         } else if (
-            row.status === "binance_only"
+            row.status ===
+            "binanceOnly"
         ) {
 
             tr.className =
@@ -1269,207 +1640,270 @@ function renderRows(rows) {
         }
 
 
-        let d =
-            row.delta;
-
-        let b =
-            row.binance;
-
-
         let deltaRate =
-            d
-                ? fmtRate(d.rate_pct)
+            row.delta
+                ? rateText(
+                    row.delta.rate_pct
+                )
                 : "-";
 
+
         let deltaInterval =
-            d
-                ? fmtInterval(
-                    d.interval_sec
+            row.delta
+                ? intervalText(
+                    row.delta.interval_sec
                 )
                 : "-";
 
 
         let binanceRate =
-            b
-                ? fmtRate(b.rate_pct)
+            row.binance
+                ? rateText(
+                    row.binance.rate_pct
+                )
                 : "-";
 
+
         let binanceInterval =
-            b
-                ? fmtInterval(
-                    b.interval_sec
+            row.binance
+                ? intervalText(
+                    row.binance.interval_sec
                 )
                 : "-";
 
 
         let gap =
-            row.gap_hourly_pct;
+            gapText(
+                row.gap
+            );
 
 
-        let gapText =
-            fmtGap(gap);
-
-
-        if (
-            gap !== null &&
-            gap !== undefined &&
-            Number.isFinite(Number(gap))
-        ) {
-
-            if (Number(gap) >= 0) {
-
-                gapText =
-                    "+" + gapText;
-
-            }
-        }
-
-
-        let nextFunding =
+        let next =
             "-";
 
-        if (d && d.next_funding_ms) {
-
-            nextFunding =
-                fmtNext(
-                    d.next_funding_ms
-                );
-
-        } else if (
-            b &&
-            b.next_funding_ms
-        ) {
-
-            nextFunding =
-                fmtNext(
-                    b.next_funding_ms
-                );
-        }
-
-
-        let statusText = "";
 
         if (
-            row.status ===
-            "delta_only"
+            row.binance &&
+            row.binance.next_funding_ms
         ) {
 
-            statusText =
-                "Delta only";
+            next =
+                timeText(
+                    row.binance.next_funding_ms
+                );
 
         } else if (
-            row.status ===
-            "binance_only"
+            row.delta &&
+            row.delta.next_funding_ms
         ) {
 
-            statusText =
-                "Binance only";
-
-        } else {
-
-            statusText =
-                "Common";
+            next =
+                timeText(
+                    row.delta.next_funding_ms
+                );
         }
+
+
+        let status =
+            row.status ===
+            "common"
+                ? "Common"
+                : (
+                    row.status ===
+                    "deltaOnly"
+                        ? "Delta only"
+                        : "Binance only"
+                );
 
 
         tr.innerHTML = `
 
-            <td>
-                ${escapeHtml(row.base)}
-            </td>
+<td>
+${escapeHtml(row.base)}
+</td>
 
-            <td>
-                ${deltaRate}
-            </td>
+<td>
+${deltaRate}
+</td>
 
-            <td>
-                ${deltaInterval}
-            </td>
+<td>
+${deltaInterval}
+</td>
 
-            <td>
-                ${binanceRate}
-            </td>
+<td>
+${binanceRate}
+</td>
 
-            <td>
-                ${binanceInterval}
-            </td>
+<td>
+${binanceInterval}
+</td>
 
-            <td>
-                ${gapText}
-            </td>
+<td>
+${gap}
+</td>
 
-            <td>
-                ${nextFunding}
-            </td>
+<td>
+${next}
+</td>
 
-            <td>
-                ${statusText}
-            </td>
+<td>
+${status}
+</td>
 
-        `;
+`;
+
 
         tbody.appendChild(tr);
     }
 
 
-    document.getElementById(
-        "loading"
-    ).style.display = "none";
-
-    document.getElementById(
-        "dataTable"
-    ).style.display = "table";
+    renderStatus();
 }
 
 
-/* ==========================================================
-   HTML ESCAPE
-   ========================================================== */
+// ==========================================================
+// ESCAPE
+// ==========================================================
 
 function escapeHtml(value) {
 
     return String(value)
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;")
-        .replace(/'/g, "&#039;");
+        .replace(
+            /&/g,
+            "&amp;"
+        )
+        .replace(
+            /</g,
+            "&lt;"
+        )
+        .replace(
+            />/g,
+            "&gt;"
+        )
+        .replace(
+            /"/g,
+            "&quot;"
+        )
+        .replace(
+            /'/g,
+            "&#039;"
+        );
 }
 
 
-/* ==========================================================
-   START
-   ========================================================== */
+// ==========================================================
+// EVERYTHING
+// ==========================================================
+
+async function loadEverything() {
+
+    await loadDelta();
+
+    renderStatus();
+
+    renderTable();
+}
+
+
+// ==========================================================
+// START BINANCE
+// ==========================================================
 
 connectBinance();
 
-loadBinanceIntervals();
 
-refreshData();
+// ==========================================================
+// START DELTA
+// ==========================================================
+
+loadDelta();
 
 
-/*
- * Refresh table every 3 seconds.
- */
+// ==========================================================
+// BINANCE INTERVALS
+// ==========================================================
+
+loadFundingIntervals();
+
+
+// ==========================================================
+// REST FALLBACK
+// ==========================================================
+
+setTimeout(
+    function() {
+
+        if (
+            Object.keys(
+                binanceData
+            ).length === 0
+        ) {
+
+            binanceRestFallback();
+        }
+
+    },
+    5000
+);
+
+
+// ==========================================================
+// AUTO REFRESH
+// ==========================================================
 
 setInterval(
-    refreshData,
+    function() {
+
+        loadDelta();
+
+    },
     3000
 );
 
 
-/*
- * Try funding interval refresh every 60 seconds.
- */
+setInterval(
+    function() {
+
+        renderStatus();
+
+        renderTable();
+
+    },
+    3000
+);
+
 
 setInterval(
-    loadBinanceIntervals,
+    function() {
+
+        loadFundingIntervals();
+
+    },
     60000
+);
+
+
+setInterval(
+    function() {
+
+        if (
+            Object.keys(
+                binanceData
+            ).length === 0
+        ) {
+
+            binanceRestFallback();
+        }
+
+    },
+    10000
 );
 
 </script>
 
+
 </body>
+
 </html>
 """
 
@@ -1480,7 +1914,10 @@ setInterval(
 
 @app.route("/")
 def home():
-    return render_template_string(HTML)
+
+    return render_template_string(
+        HTML
+    )
 
 
 # ============================================================
