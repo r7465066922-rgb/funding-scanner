@@ -1,103 +1,29 @@
 import json
 import time
 import threading
-import requests
-import websocket
-
 from flask import Flask, jsonify, render_template_string
+import websocket
 
 app = Flask(__name__)
 
-DELTA_WS = "wss://public-socket.india.delta.exchange"
-BINANCE_URL = "https://fapi.binance.com/fapi/v1/premiumIndex"
-BINANCE_INFO_URL = "https://fapi.binance.com/fapi/v1/fundingInfo"
+# ============================================================
+# DATA
+# ============================================================
 
 delta_data = {}
-binance_data = {}
-binance_intervals = {}
-
-lock = threading.Lock()
-
+delta_lock = threading.Lock()
 engine_started = False
 engine_lock = threading.Lock()
 
-last_delta_error = ""
-last_binance_error = ""
-last_delta_update = 0
-last_binance_update = 0
-
-
-# =========================
+# ============================================================
 # DELTA WEBSOCKET
-# =========================
+# ============================================================
 
-def delta_message(ws, message):
-    global last_delta_update
-
-    try:
-        msg = json.loads(message)
-
-        data = msg.get("d", msg)
-
-        if isinstance(data, dict):
-            items = [data]
-        elif isinstance(data, list):
-            items = data
-        else:
-            return
-
-        changed = False
-
-        with lock:
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-
-                if item.get("type") != "funding_rate":
-                    continue
-
-                symbol = item.get("sy")
-                rate = item.get("fr")
-                interval = item.get("fi")
-
-                if not symbol or rate is None:
-                    continue
-
-                symbol = str(symbol).upper()
-
-                if symbol.endswith("USD"):
-                    coin = symbol[:-3]
-                else:
-                    coin = symbol
-
-                try:
-                    rate = float(rate)
-                except Exception:
-                    continue
-
-                try:
-                    interval = int(interval) if interval else 28800
-                except Exception:
-                    interval = 28800
-
-                delta_data[coin] = {
-                    "symbol": symbol,
-                    "rate": rate,
-                    "interval": interval,
-                    "updated": time.time()
-                }
-
-                changed = True
-
-        if changed:
-            last_delta_update = time.time()
-
-    except Exception as e:
-        last_delta_error = str(e)
+DELTA_WS = "wss://public-socket.india.delta.exchange"
 
 
-def delta_open(ws):
-    print("[DELTA] WebSocket connected", flush=True)
+def delta_on_open(ws):
+    print("[DELTA] Connected")
 
     payload = {
         "type": "subscribe",
@@ -105,462 +31,281 @@ def delta_open(ws):
             "channels": [
                 {
                     "name": "funding_rate",
-                    "symbols": ["perpetual_futures"]
+                    "symbols": ["all"]
                 }
             ]
         }
     }
 
+    ws.send(json.dumps(payload))
+    print("[DELTA] Subscribed to funding_rate / all")
+
+
+def delta_on_message(ws, message):
     try:
-        ws.send(json.dumps(payload))
-        print("[DELTA] Funding channel subscribed", flush=True)
-    except Exception as e:
-        print("[DELTA] Subscribe error:", e, flush=True)
+        data = json.loads(message)
 
+        # Funding message
+        if data.get("type") == "funding_rate":
+            symbol = data.get("sy") or data.get("symbol")
 
-def delta_error(ws, error):
-    global last_delta_error
-    last_delta_error = str(error)
-    print("[DELTA] ERROR:", error, flush=True)
+            if not symbol:
+                return
 
+            fr = data.get("fr")
+            fi = data.get("fi")
+            next_time = data.get("nfr")
 
-def delta_close(ws, close_status_code, close_msg):
-    print(
-        "[DELTA] Disconnected:",
-        close_status_code,
-        close_msg,
-        flush=True
-    )
+            if fr is None:
+                fr = data.get("funding_rate")
 
+            if fi is None:
+                fi = data.get("funding_interval")
 
-def delta_loop():
-    global last_delta_error
+            if fr is None:
+                return
 
-    print("[DELTA] Thread started", flush=True)
+            try:
+                fr = float(fr)
+            except:
+                return
 
-    while True:
-        try:
-            ws = websocket.WebSocketApp(
-                DELTA_WS,
-                on_open=delta_open,
-                on_message=delta_message,
-                on_error=delta_error,
-                on_close=delta_close
-            )
+            try:
+                fi = int(fi) if fi else 28800
+            except:
+                fi = 28800
 
-            ws.run_forever(
-                ping_interval=30,
-                ping_timeout=10,
-                http_proxy_host=None,
-                http_proxy_port=None,
-                proxy_type=None
-            )
-
-        except Exception as e:
-            last_delta_error = str(e)
-            print("[DELTA] Connection exception:", e, flush=True)
-
-        print("[DELTA] Reconnecting in 5 seconds...", flush=True)
-        time.sleep(5)
-
-
-# =========================
-# BINANCE
-# =========================
-
-def update_binance():
-    global last_binance_error
-    global last_binance_update
-
-    print("[BINANCE] Thread started", flush=True)
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 funding-scanner"
-    }
-
-    while True:
-
-        try:
-            response = requests.get(
-                BINANCE_URL,
-                headers=headers,
-                timeout=15
-            )
-
-            response.raise_for_status()
-
-            data = response.json()
-
-            new_data = {}
-
-            for item in data:
-
-                symbol = item.get("symbol", "")
-
-                if not symbol.endswith("USDT"):
-                    continue
-
-                coin = symbol[:-4]
-
-                try:
-                    rate = float(item.get("lastFundingRate", 0))
-                except Exception:
-                    continue
-
-                try:
-                    next_time = int(item.get("nextFundingTime", 0))
-                except Exception:
-                    next_time = 0
-
-                new_data[coin] = {
+            # Delta fr is already percentage.
+            # Example: 0.00638 means 0.00638%
+            with delta_lock:
+                delta_data[symbol] = {
                     "symbol": symbol,
-                    "rate": rate,
-                    "nextFundingTime": next_time,
+                    "rate_pct": fr,
+                    "interval": fi,
+                    "next_funding": next_time,
                     "updated": time.time()
                 }
 
-            with lock:
-                binance_data.clear()
-                binance_data.update(new_data)
+    except Exception as e:
+        print("[DELTA] MESSAGE ERROR:", e)
 
-            last_binance_update = time.time()
 
-            print(
-                "[BINANCE] Funding coins:",
-                len(new_data),
-                flush=True
-            )
+def delta_on_error(ws, error):
+    print("[DELTA] ERROR:", error)
 
-        except Exception as e:
-            last_binance_error = str(e)
-            print("[BINANCE] ERROR:", e, flush=True)
 
-        # Funding interval information
+def delta_on_close(ws, code, msg):
+    print("[DELTA] CLOSED:", code, msg)
+
+
+def delta_worker():
+    while True:
         try:
-            response = requests.get(
-                BINANCE_INFO_URL,
-                headers=headers,
-                timeout=15
+            print("[DELTA] Connecting...")
+
+            ws = websocket.WebSocketApp(
+                DELTA_WS,
+                on_open=delta_on_open,
+                on_message=delta_on_message,
+                on_error=delta_on_error,
+                on_close=delta_on_close
             )
 
-            response.raise_for_status()
-
-            info = response.json()
-
-            new_intervals = {}
-
-            for item in info:
-
-                symbol = item.get("symbol", "")
-
-                if not symbol.endswith("USDT"):
-                    continue
-
-                coin = symbol[:-4]
-
-                hours = item.get("fundingIntervalHours")
-
-                if hours is None:
-                    continue
-
-                try:
-                    hours = float(hours)
-                except Exception:
-                    continue
-
-                if hours > 0:
-                    new_intervals[coin] = hours * 3600
-
-            with lock:
-                binance_intervals.clear()
-                binance_intervals.update(new_intervals)
+            ws.run_forever(
+                ping_interval=25,
+                ping_timeout=10
+            )
 
         except Exception as e:
-            last_binance_error = str(e)
-            print(
-                "[BINANCE] Interval ERROR:",
-                e,
-                flush=True
-            )
+            print("[DELTA] CONNECTION ERROR:", e)
 
-        time.sleep(15)
+        print("[DELTA] Reconnecting in 5 seconds...")
+        time.sleep(5)
 
 
-# =========================
-# ENGINE START
-# =========================
+# ============================================================
+# ENGINE
+# ============================================================
 
 def start_engine():
     global engine_started
 
     with engine_lock:
-
         if engine_started:
             return
 
         engine_started = True
 
-        print("[ENGINE] Starting data engine...", flush=True)
-
-        delta_thread = threading.Thread(
-            target=delta_loop,
-            name="delta-thread",
+        t = threading.Thread(
+            target=delta_worker,
             daemon=True
         )
+        t.start()
 
-        binance_thread = threading.Thread(
-            target=update_binance,
-            name="binance-thread",
-            daemon=True
-        )
-
-        delta_thread.start()
-        binance_thread.start()
-
-        print("[ENGINE] Threads started", flush=True)
+        print("[ENGINE] Started")
 
 
-# =========================
+# ============================================================
 # API
-# =========================
+# ============================================================
+
+@app.route("/")
+def home():
+    start_engine()
+    return render_template_string(HTML)
+
 
 @app.route("/api/data")
 def api_data():
-
-    # Important:
-    # Start only after Gunicorn worker receives a request.
-    # This makes Render/Gunicorn much more reliable.
     start_engine()
 
-    with lock:
-        delta = dict(delta_data)
-        binance = dict(binance_data)
-        intervals = dict(binance_intervals)
-
-    common = sorted(
-        set(delta.keys()) & set(binance.keys())
-    )
-
-    rows = []
-
-    for coin in common:
-
-        try:
-            d = delta[coin]
-            b = binance[coin]
-
-            delta_rate = float(d["rate"])
-            delta_interval = int(d.get("interval") or 28800)
-
-            binance_rate = float(b["rate"])
-
-            binance_interval = intervals.get(
-                coin,
-                28800
-            )
-
-            if delta_interval <= 0:
-                delta_interval = 28800
-
-            if binance_interval <= 0:
-                binance_interval = 28800
-
-            # Delta FR is already percentage.
-            delta_pct = delta_rate
-
-            # Binance FR is decimal.
-            binance_pct = binance_rate * 100
-
-            # Convert both to hourly percentage.
-            delta_hourly_pct = (
-                delta_pct *
-                3600 /
-                delta_interval
-            )
-
-            binance_hourly_pct = (
-                binance_pct *
-                3600 /
-                binance_interval
-            )
-
-            gap_hourly_pct = (
-                delta_hourly_pct -
-                binance_hourly_pct
-            )
-
-            rows.append({
-                "coin": coin,
-
-                "delta_rate": delta_pct,
-                "delta_interval": delta_interval,
-
-                "binance_rate": binance_pct,
-                "binance_interval": binance_interval,
-
-                "delta_hourly": delta_hourly_pct,
-                "binance_hourly": binance_hourly_pct,
-
-                "gap_hourly": gap_hourly_pct,
-
-                "delta_symbol": d.get("symbol"),
-                "binance_symbol": b.get("symbol")
-            })
-
-        except Exception:
-            continue
-
-    # Default: biggest absolute gap first
-    rows.sort(
-        key=lambda x: abs(x["gap_hourly"]),
-        reverse=True
-    )
+    with delta_lock:
+        data = list(delta_data.values())
 
     return jsonify({
-        "success": True,
-        "count": len(rows),
-        "updated": time.time(),
-
-        "debug": {
-            "delta_count": len(delta),
-            "binance_count": len(binance),
-            "common_count": len(common),
-
-            "engine_started": engine_started,
-
-            "delta_updated": last_delta_update,
-            "binance_updated": last_binance_update,
-
-            "last_delta_error": last_delta_error,
-            "last_binance_error": last_binance_error
-        },
-
-        "data": rows
+        "delta": data,
+        "delta_count": len(data),
+        "server_time": int(time.time() * 1000)
     })
 
-
-# =========================
-# STATUS
-# =========================
 
 @app.route("/status")
 def status():
-
-    with lock:
-        dc = len(delta_data)
-        bc = len(binance_data)
+    with delta_lock:
+        count = len(delta_data)
 
     return jsonify({
-        "status": "running",
-        "engine_started": engine_started,
-        "delta_count": dc,
-        "binance_count": bc,
-        "delta_last_update": last_delta_update,
-        "binance_last_update": last_binance_update,
-        "delta_error": last_delta_error,
-        "binance_error": last_binance_error
+        "status": "ok",
+        "delta_count": count,
+        "engine_started": engine_started
     })
 
 
-# =========================
-# WEB PAGE
-# =========================
+# ============================================================
+# HTML
+# ============================================================
 
-HTML = """
+HTML = r"""
 <!DOCTYPE html>
 <html>
 <head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 
-<meta name="viewport"
-      content="width=device-width, initial-scale=1">
-
-<title>Funding Rate Scanner</title>
+<title>Funding Rate Gap Scanner</title>
 
 <style>
 
 body {
     font-family: Arial, sans-serif;
+    background: #111;
+    color: white;
     margin: 0;
     padding: 12px;
-    background: #f5f5f5;
 }
 
 h2 {
-    margin: 5px 0 10px;
+    margin: 5px 0 10px 0;
 }
 
-#status {
-    background: white;
+.status {
+    background: #1d1d1d;
     padding: 10px;
     border-radius: 8px;
     margin-bottom: 10px;
-    font-size: 13px;
+    font-size: 14px;
+}
+
+.connected {
+    color: #00e676;
+}
+
+.disconnected {
+    color: #ff5252;
+}
+
+.loading {
+    color: #ffca28;
 }
 
 .table-wrap {
     overflow-x: auto;
-    background: white;
     border-radius: 8px;
 }
 
 table {
-    border-collapse: collapse;
     width: 100%;
-    min-width: 900px;
+    min-width: 850px;
+    border-collapse: collapse;
+    background: #1a1a1a;
 }
 
 th {
-    background: #222;
-    color: white;
-    padding: 10px 7px;
+    background: #252525;
     position: sticky;
     top: 0;
-    cursor: pointer;
+    padding: 10px 6px;
+    font-size: 13px;
 }
 
 td {
-    padding: 8px 7px;
-    border-bottom: 1px solid #ddd;
-    text-align: right;
-    white-space: nowrap;
+    padding: 9px 6px;
+    border-bottom: 1px solid #333;
+    text-align: center;
+    font-size: 13px;
 }
 
-td:first-child,
-th:first-child {
+.coin {
+    font-weight: bold;
     text-align: left;
 }
 
-.gap-positive {
+.gap {
     font-weight: bold;
+    font-size: 14px;
 }
 
-.gap-negative {
-    font-weight: bold;
+button {
+    background: #333;
+    color: white;
+    border: 0;
+    padding: 8px 12px;
+    border-radius: 6px;
 }
 
 .small {
     font-size: 11px;
-    color: #666;
-}
-
-button {
-    padding: 8px 12px;
-    border: 0;
-    border-radius: 6px;
-    background: #222;
-    color: white;
+    color: #aaa;
 }
 
 </style>
-
 </head>
 
 <body>
 
 <h2>Funding Rate Gap Scanner</h2>
 
-<div id="status">
-    Loading...
+<div class="status">
+
+<div>
+Delta:
+<span id="deltaStatus" class="loading">Connecting...</span>
+</div>
+
+<div>
+Binance:
+<span id="binanceStatus" class="loading">Connecting...</span>
+</div>
+
+<div>
+Common:
+<span id="commonStatus">0</span>
+</div>
+
+<div class="small">
+Binance data: browser WebSocket
+</div>
+
 </div>
 
 <div class="table-wrap">
@@ -573,28 +318,30 @@ button {
 
 <th>Coin</th>
 
-<th>Delta FR</th>
+<th>Delta<br>Funding</th>
 
-<th>Delta Interval</th>
+<th>Delta<br>Interval</th>
 
-<th>Binance FR</th>
+<th>Binance<br>Funding</th>
 
-<th>Binance Interval</th>
+<th>Binance<br>Interval</th>
 
-<th>Delta / H</th>
-
-<th>Binance / H</th>
-
-<th id="gapHeader"
-    onclick="toggleGapSort()">
-    Gap / H ↕
+<th id="gapHeader" onclick="toggleGapSort()">
+Gap / H ↕
 </th>
+
+<th>Next Funding</th>
 
 </tr>
 
 </thead>
 
 <tbody id="rows">
+
+<tr>
+<td colspan="7">Connecting...</td>
+</tr>
+
 </tbody>
 
 </table>
@@ -604,119 +351,609 @@ button {
 
 <script>
 
-let allRows = [];
+let deltaData = {};
+
+let binanceData = {};
 
 let gapSortMode = "none";
 
+let binanceWS = null;
 
-function formatRate(value) {
+let reconnectTimer = null;
 
-    if (value === null || value === undefined) {
+let binanceIntervalMap = {};
+
+
+// ============================================================
+// BINANCE INTERVAL
+// ============================================================
+
+async function loadBinanceIntervals() {
+
+    try {
+
+        const response = await fetch(
+            "https://fapi.binance.com/fapi/v1/fundingInfo",
+            {
+                cache: "no-store"
+            }
+        );
+
+        if (!response.ok) {
+            throw new Error("HTTP " + response.status);
+        }
+
+        const data = await response.json();
+
+        if (Array.isArray(data)) {
+
+            for (const x of data) {
+
+                if (x.symbol && x.fundingIntervalHours) {
+
+                    binanceIntervalMap[
+                        x.symbol
+                    ] = Number(x.fundingIntervalHours);
+
+                }
+
+            }
+
+        }
+
+        console.log(
+            "Binance funding intervals loaded:",
+            Object.keys(binanceIntervalMap).length
+        );
+
+    } catch (e) {
+
+        console.log(
+            "Binance fundingInfo unavailable. Using 8h default.",
+            e
+        );
+
+    }
+
+}
+
+
+// ============================================================
+// BINANCE WEBSOCKET
+// ============================================================
+
+function connectBinance() {
+
+    if (binanceWS) {
+
+        try {
+            binanceWS.close();
+        } catch(e) {}
+
+    }
+
+    document.getElementById(
+        "binanceStatus"
+    ).textContent = "Connecting...";
+
+    document.getElementById(
+        "binanceStatus"
+    ).className = "loading";
+
+
+    const url =
+        "wss://fstream.binance.com/market/ws/!markPrice@arr@1s";
+
+
+    try {
+
+        binanceWS = new WebSocket(url);
+
+    } catch (e) {
+
+        console.log("Binance WS create error:", e);
+
+        scheduleBinanceReconnect();
+
+        return;
+    }
+
+
+    binanceWS.onopen = function() {
+
+        console.log("Binance WebSocket connected");
+
+        document.getElementById(
+            "binanceStatus"
+        ).textContent = "Connected";
+
+        document.getElementById(
+            "binanceStatus"
+        ).className = "connected";
+    };
+
+
+    binanceWS.onmessage = function(event) {
+
+        try {
+
+            const payload = JSON.parse(event.data);
+
+            let arr = payload;
+
+            // Combined wrapper support
+            if (payload && payload.data) {
+                arr = payload.data;
+            }
+
+            if (!Array.isArray(arr)) {
+                arr = [arr];
+            }
+
+
+            for (const item of arr) {
+
+                if (!item) continue;
+
+                const symbol = item.s;
+
+                if (!symbol) continue;
+
+                // Only USDT-M symbols
+                if (!symbol.endsWith("USDT")) {
+                    continue;
+                }
+
+                const rate = Number(item.r);
+
+                if (!Number.isFinite(rate)) {
+                    continue;
+                }
+
+                const intervalHours =
+                    Number(
+                        binanceIntervalMap[symbol]
+                    ) || 8;
+
+                binanceData[symbol] = {
+
+                    symbol: symbol,
+
+                    rateDecimal: rate,
+
+                    ratePct: rate * 100,
+
+                    intervalHours: intervalHours,
+
+                    intervalSeconds:
+                        intervalHours * 3600,
+
+                    nextFunding: item.T || null,
+
+                    updated: Date.now()
+                };
+
+            }
+
+
+            updateBinanceStatus();
+
+            renderRows();
+
+        } catch (e) {
+
+            console.log(
+                "Binance message error:",
+                e
+            );
+
+        }
+
+    };
+
+
+    binanceWS.onerror = function(error) {
+
+        console.log(
+            "Binance WebSocket error",
+            error
+        );
+
+        document.getElementById(
+            "binanceStatus"
+        ).textContent = "Error";
+
+        document.getElementById(
+            "binanceStatus"
+        ).className = "disconnected";
+    };
+
+
+    binanceWS.onclose = function() {
+
+        console.log(
+            "Binance WebSocket closed"
+        );
+
+        document.getElementById(
+            "binanceStatus"
+        ).textContent = "Disconnected";
+
+        document.getElementById(
+            "binanceStatus"
+        ).className = "disconnected";
+
+        scheduleBinanceReconnect();
+    };
+
+}
+
+
+function scheduleBinanceReconnect() {
+
+    if (reconnectTimer) {
+        return;
+    }
+
+    reconnectTimer = setTimeout(
+        function() {
+
+            reconnectTimer = null;
+
+            connectBinance();
+
+        },
+        5000
+    );
+
+}
+
+
+// ============================================================
+// BINANCE STATUS
+// ============================================================
+
+function updateBinanceStatus() {
+
+    const count =
+        Object.keys(binanceData).length;
+
+    document.getElementById(
+        "binanceStatus"
+    ).textContent =
+        "Connected (" + count + ")";
+
+    document.getElementById(
+        "binanceStatus"
+    ).className = "connected";
+
+}
+
+
+// ============================================================
+// DELTA DATA
+// ============================================================
+
+async function loadDelta() {
+
+    try {
+
+        const response =
+            await fetch(
+                "/api/data?t=" + Date.now(),
+                {
+                    cache: "no-store"
+                }
+            );
+
+        const data =
+            await response.json();
+
+        deltaData = {};
+
+        if (Array.isArray(data.delta)) {
+
+            for (const x of data.delta) {
+
+                if (!x.symbol) continue;
+
+                const coin =
+                    x.symbol
+                    .replace(/USD$/, "");
+
+                deltaData[coin] = {
+
+                    symbol: x.symbol,
+
+                    ratePct:
+                        Number(x.rate_pct),
+
+                    intervalSeconds:
+                        Number(x.interval) || 28800,
+
+                    nextFunding:
+                        x.next_funding || null
+                };
+
+            }
+
+        }
+
+        document.getElementById(
+            "deltaStatus"
+        ).textContent =
+            "Connected (" +
+            Object.keys(deltaData).length +
+            ")";
+
+        document.getElementById(
+            "deltaStatus"
+        ).className = "connected";
+
+
+        renderRows();
+
+    } catch (e) {
+
+        console.log(
+            "Delta API error:",
+            e
+        );
+
+        document.getElementById(
+            "deltaStatus"
+        ).textContent = "Error";
+
+        document.getElementById(
+            "deltaStatus"
+        ).className = "disconnected";
+
+    }
+
+}
+
+
+// ============================================================
+// FORMAT
+// ============================================================
+
+function formatRate(x) {
+
+    if (!Number.isFinite(x)) {
         return "-";
     }
 
-    return Number(value).toFixed(6) + "%";
+    return x.toFixed(5) + "%";
+
 }
 
 
 function formatInterval(seconds) {
 
-    let hours = Number(seconds) / 3600;
-
-    if (hours === 1) {
-        return "1h";
+    if (!seconds) {
+        return "-";
     }
 
-    if (hours === 2) {
-        return "2h";
+    const h =
+        seconds / 3600;
+
+    if (Number.isInteger(h)) {
+        return h + "h";
     }
 
-    if (hours === 4) {
-        return "4h";
-    }
+    return h.toFixed(2) + "h";
 
-    if (hours === 8) {
-        return "8h";
-    }
-
-    return hours.toFixed(2) + "h";
 }
 
 
-function renderRows(rows) {
+function formatTime(timestamp) {
 
-    let sorted = [...rows];
+    if (!timestamp) {
+        return "-";
+    }
 
+    let ms =
+        Number(timestamp);
+
+    // Delta nfr can be microseconds
+    if (ms > 100000000000000) {
+        ms = ms / 1000;
+    }
+
+    if (ms < 10000000000) {
+        ms = ms * 1000;
+    }
+
+    const d =
+        new Date(ms);
+
+    if (isNaN(d.getTime())) {
+        return "-";
+    }
+
+    return d.toLocaleTimeString(
+        [],
+        {
+            hour: "2-digit",
+            minute: "2-digit",
+            second: "2-digit"
+        }
+    );
+
+}
+
+
+// ============================================================
+// RENDER
+// ============================================================
+
+function renderRows() {
+
+    const tbody =
+        document.getElementById("rows");
+
+    const rows = [];
+
+
+    for (const coin in deltaData) {
+
+        const d =
+            deltaData[coin];
+
+        const b =
+            binanceData[coin + "USDT"];
+
+        if (!b) {
+            continue;
+        }
+
+
+        const deltaHourly =
+            d.ratePct *
+            3600 /
+            d.intervalSeconds;
+
+
+        const binanceHourly =
+            b.ratePct *
+            3600 /
+            b.intervalSeconds;
+
+
+        const gap =
+            deltaHourly -
+            binanceHourly;
+
+
+        rows.push({
+
+            coin: coin,
+
+            deltaRate:
+                d.ratePct,
+
+            deltaInterval:
+                d.intervalSeconds,
+
+            binanceRate:
+                b.ratePct,
+
+            binanceInterval:
+                b.intervalSeconds,
+
+            gap: gap,
+
+            nextFunding:
+                b.nextFunding ||
+                d.nextFunding
+        });
+
+    }
+
+
+    // Sort
     if (gapSortMode === "desc") {
 
-        sorted.sort(
-            (a, b) =>
-                Math.abs(b.gap_hourly) -
-                Math.abs(a.gap_hourly)
+        rows.sort(
+            (a,b) =>
+                Math.abs(b.gap) -
+                Math.abs(a.gap)
         );
 
-    } else if (gapSortMode === "asc") {
+    }
 
-        sorted.sort(
-            (a, b) =>
-                Math.abs(a.gap_hourly) -
-                Math.abs(b.gap_hourly)
+    else if (gapSortMode === "asc") {
+
+        rows.sort(
+            (a,b) =>
+                Math.abs(a.gap) -
+                Math.abs(b.gap)
         );
+
     }
 
-    const body = document.getElementById("rows");
+    else {
 
-    body.innerHTML = "";
+        rows.sort(
+            (a,b) =>
+                Math.abs(b.gap) -
+                Math.abs(a.gap)
+        );
 
-    for (const r of sorted) {
-
-        const tr = document.createElement("tr");
-
-        let gapClass =
-            r.gap_hourly >= 0
-                ? "gap-positive"
-                : "gap-negative";
-
-        tr.innerHTML = `
-
-<td>
-    <b>${r.coin}</b>
-</td>
-
-<td>
-    ${formatRate(r.delta_rate)}
-</td>
-
-<td>
-    ${formatInterval(r.delta_interval)}
-</td>
-
-<td>
-    ${formatRate(r.binance_rate)}
-</td>
-
-<td>
-    ${formatInterval(r.binance_interval)}
-</td>
-
-<td>
-    ${formatRate(r.delta_hourly)}
-</td>
-
-<td>
-    ${formatRate(r.binance_hourly)}
-</td>
-
-<td class="${gapClass}">
-    ${formatRate(r.gap_hourly)}
-</td>
-
-`;
-
-        body.appendChild(tr);
     }
+
+
+    document.getElementById(
+        "commonStatus"
+    ).textContent =
+        rows.length;
+
+
+    if (rows.length === 0) {
+
+        tbody.innerHTML =
+            '<tr><td colspan="7">' +
+            'Waiting for Delta + Binance data...' +
+            '</td></tr>';
+
+        return;
+    }
+
+
+    let html = "";
+
+
+    for (const r of rows) {
+
+        const gapText =
+            (r.gap >= 0 ? "+" : "") +
+            r.gap.toFixed(5) +
+            "%";
+
+
+        html +=
+            "<tr>" +
+
+            "<td class='coin'>" +
+            r.coin +
+            "</td>" +
+
+            "<td>" +
+            formatRate(r.deltaRate) +
+            "</td>" +
+
+            "<td>" +
+            formatInterval(r.deltaInterval) +
+            "</td>" +
+
+            "<td>" +
+            formatRate(r.binanceRate) +
+            "</td>" +
+
+            "<td>" +
+            formatInterval(r.binanceInterval) +
+            "</td>" +
+
+            "<td class='gap'>" +
+            gapText +
+            "</td>" +
+
+            "<td>" +
+            formatTime(r.nextFunding) +
+            "</td>" +
+
+            "</tr>";
+    }
+
+
+    tbody.innerHTML = html;
+
 }
 
+
+// ============================================================
+// GAP SORT
+// ============================================================
 
 function toggleGapSort() {
 
@@ -724,74 +961,52 @@ function toggleGapSort() {
 
         gapSortMode = "desc";
 
-    } else if (gapSortMode === "desc") {
+        document.getElementById(
+            "gapHeader"
+        ).textContent =
+            "Gap / H ↓";
+
+    }
+
+    else if (gapSortMode === "desc") {
 
         gapSortMode = "asc";
 
-    } else {
+        document.getElementById(
+            "gapHeader"
+        ).textContent =
+            "Gap / H ↑";
 
-        gapSortMode = "desc";
     }
 
-    renderRows(allRows);
+    else {
 
-    const header =
-        document.getElementById("gapHeader");
+        gapSortMode = "none";
 
-    if (gapSortMode === "desc") {
+        document.getElementById(
+            "gapHeader"
+        ).textContent =
+            "Gap / H ↕";
 
-        header.innerText = "Gap / H ↓";
-
-    } else {
-
-        header.innerText = "Gap / H ↑";
     }
+
+    renderRows();
+
 }
 
 
-async function loadData() {
+// ============================================================
+// START
+// ============================================================
 
-    try {
+loadBinanceIntervals();
 
-        const response =
-            await fetch("/api/data?t=" + Date.now());
+connectBinance();
 
-        const result =
-            await response.json();
-
-        if (!result.success) {
-            throw new Error("API error");
-        }
-
-        allRows = result.data || [];
-
-        renderRows(allRows);
-
-        const d =
-            result.debug || {};
-
-        document.getElementById("status").innerHTML =
-            "Coins: <b>" + result.count + "</b>" +
-            " | Delta: <b>" + (d.delta_count || 0) + "</b>" +
-            " | Binance: <b>" + (d.binance_count || 0) + "</b>" +
-            " | Common: <b>" + (d.common_count || 0) + "</b>" +
-            "<br><span class='small'>" +
-            "Auto refresh: 10 sec" +
-            "</span>";
-
-    } catch (error) {
-
-        document.getElementById("status").innerHTML =
-            "<b>API Error:</b> " +
-            error.message;
-    }
-}
-
-
-loadData();
+loadDelta();
 
 setInterval(
-    loadData,
+    loadDelta,
     10000
 );
 
@@ -802,28 +1017,12 @@ setInterval(
 """
 
 
-@app.route("/")
-def home():
-    return render_template_string(HTML)
-
-
-# =========================
-# LOCAL RUN
-# =========================
+# ============================================================
+# START APP
+# ============================================================
 
 if __name__ == "__main__":
-
-    import os
-
-    port = int(
-        os.environ.get(
-            "PORT",
-            "5000"
-        )
-    )
-
     app.run(
         host="0.0.0.0",
-        port=port,
-        debug=False
+        port=10000
     )
